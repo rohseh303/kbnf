@@ -34,19 +34,33 @@ let config = Config::hardened();
 let engine = Engine::with_config(user_grammar, vocabulary, config)?;
 ```
 
-The profile caps source and AST size, nesting, string tables, regex source and DFA
-memory, estimated EBNF expansion, simplified productions/symbols, and cooperative
-compile time. Each rejection includes its phase, stable resource name, observed
-value, and configured limit. Every limit can be tuned through `Config::grammar_limits`.
+The profile bounds two phases:
 
-Python users get the same policy and a cheap preflight report:
+- **Construction** (`Config::grammar_limits`, a `GrammarLimits`): source and AST size,
+  nesting, string tables, regex source bytes, an estimated regex NFA size (so nested
+  counted repetitions such as `(a{1,100}){1,100}` are refused before the regex compiler
+  runs), DFA memory, estimated EBNF expansion, simplified productions/symbols, and a
+  cooperative compile deadline.
+- **Decoding** (`Config::decode_limits`, a `DecodeLimits`): the number of Earley items in
+  the newest set and across the whole chart after every accepted byte, and the number of
+  entries retained in the allowed-token cache. A token that would exceed a chart budget is
+  masked out during `compute_allowed_token_ids` and rejected with
+  `AcceptTokenError::ResourceLimitExceeded` if forced, leaving the engine state untouched.
+
+Each rejection includes its phase, stable resource name, observed value, and configured
+limit. Every limit is optional and can be tuned individually.
+
+Python users get the same policy, a cheap preflight report, and a vocabulary-free full
+check that a service can run in an isolated worker before building an engine:
 
 ```python
 import kbnf
 
 config = kbnf.Config.hardened()
-complexity = kbnf.inspect_grammar(user_grammar)
-engine = kbnf.InternalEngine(user_grammar, vocabulary, config)
+complexity = kbnf.inspect_grammar(user_grammar)          # parse-only metrics
+complexity = kbnf.check_grammar(user_grammar, config)    # full pipeline under the policy
+engine = kbnf.Engine(user_grammar, vocabulary, config)
+engine.earley_chart_size(), engine.cache_size()          # decode-time observability
 ```
 
 `max_compile_millis` is checked between construction phases; it cannot preempt a

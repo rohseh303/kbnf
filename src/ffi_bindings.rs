@@ -860,6 +860,24 @@ impl Engine {
         self.__repr__()
     }
 
+    /// Number of entries currently retained in the allowed-token cache.
+    #[pyo3(name = "cache_size")]
+    pub fn cache_size_py(&self) -> usize {
+        self.cache_size()
+    }
+
+    /// Returns `(items in the newest Earley set, items across the whole chart)`.
+    #[pyo3(name = "earley_chart_size")]
+    pub fn earley_chart_size_py(&self) -> (usize, usize) {
+        self.earley_chart_size()
+    }
+
+    /// The decode limits this engine enforces.
+    #[pyo3(name = "decode_limits")]
+    pub fn decode_limits_py(&self) -> crate::limits::DecodeLimits {
+        self.decode_limits()
+    }
+
     fn __copy__(&self) -> Engine {
         self.clone()
     }
@@ -915,5 +933,65 @@ impl crate::limits::GrammarLimits {
     #[pyo3(name = "hardened")]
     pub fn hardened_py() -> Self {
         Self::hardened()
+    }
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl crate::limits::GrammarLimits {
+    fn __repr__(&self) -> String {
+        format!("{self:?}")
+    }
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl crate::limits::DecodeLimits {
+    /// Creates a new unbounded decode policy.
+    #[new]
+    pub fn new_py() -> Self {
+        Self::default()
+    }
+
+    /// Creates the conservative multi-tenant decode policy.
+    #[staticmethod]
+    #[pyo3(name = "hardened")]
+    pub fn hardened_py() -> Self {
+        Self::hardened()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("{self:?}")
+    }
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl crate::limits::GrammarComplexity {
+    fn __repr__(&self) -> String {
+        format!("{self:?}")
+    }
+
+    /// Returns the metrics as a plain dictionary, convenient for logs and admission telemetry.
+    pub fn to_dict<'py>(&self, py: Python<'py>) -> pyo3::PyResult<pyo3::Bound<'py, PyDict>> {
+        use pyo3::types::PyDictMethods;
+        let dict = PyDict::new(py);
+        dict.set_item("source_bytes", self.source_bytes)?;
+        dict.set_item("ast_nodes", self.ast_nodes)?;
+        dict.set_item("nesting_depth", self.nesting_depth)?;
+        dict.set_item("nonterminals", self.nonterminals)?;
+        dict.set_item("terminals", self.terminals)?;
+        dict.set_item("regexes", self.regexes)?;
+        dict.set_item("substrings", self.substrings)?;
+        dict.set_item("literal_bytes", self.literal_bytes)?;
+        dict.set_item("max_regex_bytes", self.max_regex_bytes)?;
+        dict.set_item("total_regex_bytes", self.total_regex_bytes)?;
+        dict.set_item("regex_size_estimate", self.regex_size_estimate)?;
+        dict.set_item("total_regex_size_estimate", self.total_regex_size_estimate)?;
+        dict.set_item("simplification_expansion", self.simplification_expansion)?;
+        dict.set_item("simplified_productions", self.simplified_productions)?;
+        dict.set_item("simplified_symbols", self.simplified_symbols)?;
+        dict.set_item("max_symbols_per_production", self.max_symbols_per_production)?;
+        Ok(dict)
     }
 }

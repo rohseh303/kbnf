@@ -21,6 +21,8 @@ pub enum AcceptTokenError {
     Rejected,
     /// The [`EngineLike`] is finished, as defined by its grammar. No more tokens can be accepted.
     Finished,
+    /// Accepting the token would exceed a configured decode resource limit. The [`EngineLike`]'s internal states are not updated.
+    ResourceLimitExceeded,
 }
 #[cfg_attr(feature = "python", pyclass(eq, eq_int))]
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
@@ -63,6 +65,8 @@ pub enum UpdateLogitsError {
     Finished,
     /// The input logits array is not of the expected length according to the vocabulary.
     InvalidLogitsLength,
+    /// Accepting the token would exceed a configured decode resource limit. The [`EngineLike`]'s internal states are not updated.
+    ResourceLimitExceeded,
 }
 pub(crate) mod sealed {
     pub trait Sealed {}

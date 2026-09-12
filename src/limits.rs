@@ -41,6 +41,13 @@ pub struct GrammarLimits {
     pub max_regex_bytes: Option<usize>,
     /// Maximum combined bytes in all regular expressions.
     pub max_total_regex_bytes: Option<usize>,
+    /// Maximum estimated NFA size of any one regular expression.
+    ///
+    /// The estimate multiplies sub-expression sizes by counted repetition bounds, so nested
+    /// repetitions such as `(a{1,100}){1,100}` are rejected before the regex compiler runs.
+    pub max_regex_size_estimate: Option<usize>,
+    /// Maximum combined estimated NFA size across all regular expressions.
+    pub max_total_regex_size_estimate: Option<usize>,
     /// Maximum static estimate of EBNF expansion work before simplification.
     pub max_simplification_expansion: Option<usize>,
     /// Maximum productions after grammar simplification.
@@ -70,12 +77,62 @@ impl GrammarLimits {
             max_literal_bytes: Some(4_194_304),
             max_regex_bytes: Some(65_536),
             max_total_regex_bytes: Some(1_048_576),
+            max_regex_size_estimate: Some(20_000),
+            max_total_regex_size_estimate: Some(200_000),
             max_simplification_expansion: Some(1_000_000),
             max_simplified_productions: Some(100_000),
             max_simplified_symbols: Some(1_000_000),
             max_symbols_per_production: Some(16_384),
             max_compile_millis: Some(5_000),
         }
+    }
+}
+
+/// Resource limits applied while an engine consumes tokens.
+///
+/// Every field is optional. `None` preserves the original unbounded behavior.
+/// Use [`DecodeLimits::hardened`] for conservative multi-tenant defaults.
+#[cfg_attr(feature = "python", pyclass)]
+#[cfg_attr(feature = "python", pyo3(get_all, set_all))]
+#[cfg_attr(feature = "wasm", wasm_bindgen(inspectable))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(default)]
+pub struct DecodeLimits {
+    /// Maximum Earley items allowed in the newest Earley set after a byte is accepted.
+    ///
+    /// Ambiguous grammars can make a single Earley set grow with the length of the
+    /// output. A token whose acceptance would exceed this bound is rejected with
+    /// [`AcceptTokenError::ResourceLimitExceeded`](crate::engine_like::AcceptTokenError)
+    /// and the engine state is left unchanged.
+    pub max_earley_items_per_set: Option<usize>,
+    /// Maximum Earley items allowed across the whole chart after a byte is accepted.
+    pub max_total_earley_items: Option<usize>,
+    /// Maximum entries retained in the allowed-token cache of one engine.
+    ///
+    /// Every entry stores a copy of the Earley chart plus a vocabulary-sized bitset, so an
+    /// unbounded cache grows linearly with the number of distinct parser states visited.
+    /// The cache is cleared when it is full; `Some(0)` disables insertion entirely.
+    pub max_cache_entries: Option<usize>,
+}
+
+impl DecodeLimits {
+    /// Conservative limits intended for engines that decode user-supplied grammars.
+    pub fn hardened() -> Self {
+        Self {
+            max_earley_items_per_set: Some(65_536),
+            max_total_earley_items: Some(1_048_576),
+            max_cache_entries: Some(1_024),
+        }
+    }
+
+    /// Returns `true` when the chart sizes are within the configured limits.
+    #[inline]
+    pub(crate) fn chart_within_limits(&self, newest_set_items: usize, total_items: usize) -> bool {
+        self.max_earley_items_per_set
+            .is_none_or(|limit| newest_set_items <= limit)
+            && self
+                .max_total_earley_items
+                .is_none_or(|limit| total_items <= limit)
     }
 }
 
@@ -105,6 +162,10 @@ pub struct GrammarComplexity {
     pub max_regex_bytes: usize,
     /// Combined bytes in regular expressions.
     pub total_regex_bytes: usize,
+    /// Largest estimated NFA size among the regular expressions.
+    pub regex_size_estimate: usize,
+    /// Combined estimated NFA size across all regular expressions.
+    pub total_regex_size_estimate: usize,
     /// Saturating static estimate of EBNF expansion work.
     pub simplification_expansion: usize,
     /// Productions after simplification, if simplification has run.
@@ -170,6 +231,14 @@ impl GrammarComplexity {
             .fold((0usize, 0usize), |(total, max), len| {
                 (total.saturating_add(len), max.max(len))
             });
+        let (total_regex_size_estimate, regex_size_estimate) = grammar
+            .interned_strings
+            .regex_strings
+            .iter()
+            .map(|(_, value)| regex_size_estimate(value))
+            .fold((0usize, 0usize), |(total, max), size| {
+                (total.saturating_add(size), max.max(size))
+            });
 
         Self {
             source_bytes: source.len(),
@@ -182,6 +251,8 @@ impl GrammarComplexity {
             literal_bytes,
             max_regex_bytes,
             total_regex_bytes,
+            regex_size_estimate,
+            total_regex_size_estimate,
             simplification_expansion,
             ..Self::default()
         }
@@ -263,6 +334,42 @@ impl GrammarComplexity {
             }
         }
         self
+    }
+}
+
+/// Estimates the Thompson NFA size of a regular expression from its parsed HIR.
+///
+/// Sub-expression sizes are multiplied by counted repetition bounds, so nested counted
+/// repetitions grow multiplicatively, mirroring how the NFA compiler unrolls them. Patterns
+/// the parser rejects contribute `0`; grammar validation reports their syntax error later.
+pub fn regex_size_estimate(pattern: &str) -> usize {
+    match regex_syntax::ParserBuilder::new().build().parse(pattern) {
+        Ok(hir) => hir_size(&hir),
+        Err(_) => 0,
+    }
+}
+
+fn hir_size(hir: &regex_syntax::hir::Hir) -> usize {
+    use regex_syntax::hir::HirKind;
+    match hir.kind() {
+        HirKind::Empty => 1,
+        HirKind::Literal(literal) => literal.0.len().max(1),
+        HirKind::Class(_) | HirKind::Look(_) => 1,
+        HirKind::Capture(capture) => hir_size(&capture.sub),
+        HirKind::Repetition(repetition) => {
+            let bound = match repetition.max {
+                Some(max) => max as usize,
+                None => (repetition.min as usize).saturating_add(1),
+            }
+            .max(1);
+            hir_size(&repetition.sub)
+                .saturating_mul(bound)
+                .saturating_add(1)
+        }
+        HirKind::Concat(parts) | HirKind::Alternation(parts) => parts
+            .iter()
+            .map(hir_size)
+            .fold(1usize, usize::saturating_add),
     }
 }
 
@@ -382,6 +489,18 @@ impl GrammarLimits {
             "total_regex_bytes",
             complexity.total_regex_bytes,
             self.max_total_regex_bytes,
+        )?;
+        Self::check_one(
+            phase,
+            "regex_size_estimate",
+            complexity.regex_size_estimate,
+            self.max_regex_size_estimate,
+        )?;
+        Self::check_one(
+            phase,
+            "total_regex_size_estimate",
+            complexity.total_regex_size_estimate,
+            self.max_total_regex_size_estimate,
         )?;
         Self::check_one(
             phase,

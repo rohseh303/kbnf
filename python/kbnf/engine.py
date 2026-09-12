@@ -154,6 +154,18 @@ class Engine:
     def shrink_to_fit(self)->None:
         self._internal.shrink_to_fit()
 
+    def cache_size(self)->int:
+        """Number of entries currently retained in the allowed-token cache."""
+        return self._internal.cache_size()
+
+    def earley_chart_size(self)->typing.Tuple[int,int]:
+        """Returns ``(items in the newest Earley set, items across the whole chart)``."""
+        return self._internal.earley_chart_size()
+
+    def decode_limits(self):
+        """The ``DecodeLimits`` this engine enforces."""
+        return self._internal.decode_limits()
+
     def reset(self)->None:
         self._internal.reset()
     

@@ -466,6 +466,7 @@ dependencies = [
  "num",
  "pyo3",
  "pyo3-log",
+ "regex-syntax",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",

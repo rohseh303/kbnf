@@ -213,6 +213,18 @@ fn adversarial_corpus_exercises_expected_boundaries() {
         ),
         Err(CreateGrammarError::ResourceLimitError(_))
     ));
+
+    let nested_repetition_limits = GrammarLimits {
+        max_regex_size_estimate: Some(1_000),
+        ..Default::default()
+    };
+    assert!(matches!(
+        compile_with_limits(
+            include_str!("adversarial_grammars/nested_repetition.kbnf"),
+            nested_repetition_limits
+        ),
+        Err(CreateGrammarError::ResourceLimitError(_))
+    ));
 }
 
 #[test]
@@ -222,4 +234,37 @@ fn lexical_depth_scanner_ignores_parentheses_in_regexes_and_comments() {
         ..Default::default()
     };
     compile_with_limits(r#"(* ((( ignored ))) *) start ::= #'(a|b)+';"#, limits).unwrap();
+}
+
+#[test]
+fn nested_counted_repetition_is_rejected_by_size_estimate() {
+    let limits = GrammarLimits {
+        max_regex_size_estimate: Some(5_000),
+        ..Default::default()
+    };
+    match compile_with_limits("start ::= #'(a{1,100}){1,100}';", limits) {
+        Err(CreateGrammarError::ResourceLimitError(error)) => {
+            assert_eq!(error.phase, GrammarPhase::Parsed);
+            assert_eq!(error.resource, "regex_size_estimate");
+            assert!(error.observed >= 10_000, "observed {}", error.observed);
+            assert_eq!(error.limit, 5_000);
+        }
+        other => panic!("expected regex size limit error, got {other:?}"),
+    }
+}
+
+#[test]
+fn regex_size_estimate_scales_with_repetition_bounds() {
+    let small = kbnf::limits::regex_size_estimate("[a-z]+");
+    let counted = kbnf::limits::regex_size_estimate("[a-z]{1,64}");
+    let nested = kbnf::limits::regex_size_estimate("([a-z]{1,64}){1,64}");
+    assert!(small < counted && counted < nested, "{small} {counted} {nested}");
+    assert!(nested >= 64 * 64);
+    assert_eq!(kbnf::limits::regex_size_estimate("(unbalanced"), 0);
+
+    let complexity = kbnf::utils::inspect_grammar("start ::= #'[a-z]{1,64}' #'x';").unwrap();
+    assert!(complexity.regex_size_estimate >= counted);
+    assert!(complexity.regex_size_estimate < counted + 8);
+    assert!(complexity.total_regex_size_estimate > complexity.regex_size_estimate);
+    compile_with_limits("start ::= #'[a-z]{1,64}';", GrammarLimits::hardened()).unwrap();
 }

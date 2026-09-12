@@ -5,7 +5,7 @@ use pyo3::pyclass;
 use serde::{Deserialize, Serialize};
 
 use crate::engine::EngineConfig;
-use crate::limits::GrammarLimits;
+use crate::limits::{DecodeLimits, GrammarLimits};
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 #[derive(Debug, Clone)]
@@ -21,6 +21,8 @@ pub struct InternalConfig {
     pub start_nonterminal: String,
     /// Resource limits for user-supplied grammars.
     pub grammar_limits: GrammarLimits,
+    /// Resource limits applied while decoding.
+    pub decode_limits: DecodeLimits,
 }
 /// The configuration of the [`Engine`](crate::engine::Engine) struct. This should suffice most scenarios.
 #[cfg_attr(feature = "python", pyclass)]
@@ -47,6 +49,10 @@ pub struct Config {
     /// The default is unlimited for backwards compatibility.
     #[serde(default)]
     pub grammar_limits: GrammarLimits,
+    /// Resource limits applied while the engine consumes tokens.
+    /// The default is unlimited for backwards compatibility.
+    #[serde(default)]
+    pub decode_limits: DecodeLimits,
 }
 /// The type of the Finite State Automaton to be used.
 #[cfg_attr(feature = "python", pyclass(eq, eq_int))]
@@ -105,6 +111,7 @@ impl Default for Config {
             compression_config: CompressionConfig { min_terminals: 5 },
             expected_output_length: u32::MAX as usize,
             grammar_limits: GrammarLimits::default(),
+            decode_limits: DecodeLimits::default(),
         }
     }
 }
@@ -113,6 +120,7 @@ impl Config {
     pub fn hardened() -> Self {
         let mut config = Self::default();
         config.grammar_limits = GrammarLimits::hardened();
+        config.decode_limits = DecodeLimits::hardened();
         config.regex_config.max_memory_usage = Some(67_108_864);
         config
     }
@@ -138,6 +146,7 @@ impl Config {
             engine_config: self.engine_config,
             start_nonterminal: self.start_nonterminal,
             grammar_limits: self.grammar_limits,
+            decode_limits: self.decode_limits,
         }
     }
 }

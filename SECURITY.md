@@ -12,6 +12,8 @@ Treat an arbitrary grammar like an untrusted query, not like inert configuration
 - source bytes and lexical nesting, checked before parsing;
 - parsed AST nodes/depth and interned nonterminal, terminal, regex, and substring counts;
 - terminal/substring bytes, per-regex bytes, and total regex bytes;
+- an estimated regex NFA size (sub-expression sizes multiplied by counted repetition
+  bounds), per regex and in total, checked before any regex is compiled;
 - a saturating EBNF simplification-expansion estimate, checked before simplification;
 - actual simplified production and symbol counts;
 - regex DFA memory through the existing regex compiler limit; and
@@ -19,7 +21,29 @@ Treat an arbitrary grammar like an untrusted query, not like inert configuration
 
 Failures are structured `GrammarLimitError` values in Rust and `ValueError`s with the
 same phase/resource/observed/limit message in Python. `inspect_grammar` provides the
-deterministic pre-compilation metrics without compiling regexes.
+deterministic pre-compilation metrics without compiling regexes; `check_grammar` runs
+the whole construction pipeline under a policy without a vocabulary, so admission can
+happen in a disposable worker before the inference process builds an engine.
+
+## Protected decode path
+
+Construction limits do not bound what happens once tokens flow. An ambiguous grammar
+can make each Earley set grow with the length of the output, and the allowed-token
+cache stores a copy of the chart plus a vocabulary-sized bitset for every distinct
+parser state it sees. `Config::decode_limits` (`DecodeLimits`, enabled by
+`Config::hardened()`) therefore caps:
+
+- Earley items in the newest set after each accepted byte;
+- Earley items across the whole chart; and
+- retained allowed-token cache entries (the cache is cleared when full).
+
+A token whose acceptance would exceed a chart budget is excluded from the allowed set
+during `compute_allowed_token_ids`; forcing it through `try_accept_new_token` or
+`update_logits` returns `ResourceLimitExceeded` and leaves the engine state unchanged.
+Tokens admitted by the eager regex cache bypass the mask-time check and are still
+rejected at accept time, so a service must treat that error as a terminal, fail-closed
+condition for the request. `Engine::earley_chart_size` and `Engine::cache_size` expose
+the counters for monitoring.
 
 The unlimited `Config::default()` behavior is retained to avoid silently breaking
 existing trusted workloads. A network service should never use that default on a

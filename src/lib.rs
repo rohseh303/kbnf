@@ -461,7 +461,7 @@ pub use engine::Engine;
 pub use engine_like::AcceptTokenResult;
 pub use engine_like::EngineLike;
 pub use grammar::Grammar;
-pub use limits::{GrammarComplexity, GrammarLimitError, GrammarLimits, GrammarPhase};
+pub use limits::{DecodeLimits, GrammarComplexity, GrammarLimitError, GrammarLimits, GrammarPhase};
 #[cfg(feature = "mimalloc")]
 use mimalloc::MiMalloc;
 #[cfg(feature = "python")]
@@ -481,6 +481,15 @@ fn inspect_grammar_py(input: &str) -> PyResult<GrammarComplexity> {
 }
 
 #[cfg(feature = "python")]
+#[pyfunction(name = "check_grammar")]
+#[pyo3(signature = (input, config = None))]
+fn check_grammar_py(input: &str, config: Option<Config>) -> PyResult<GrammarComplexity> {
+    let config = config.unwrap_or_default();
+    utils::check_grammar(input, config.internal_config())
+        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
+}
+
+#[cfg(feature = "python")]
 #[pymodule]
 #[pyo3(name = "kbnf")]
 fn kbnf(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -488,6 +497,7 @@ fn kbnf(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Config>()?;
     m.add_class::<limits::GrammarLimits>()?;
     m.add_class::<limits::GrammarComplexity>()?;
+    m.add_class::<limits::DecodeLimits>()?;
     m.add_class::<config::CompressionConfig>()?;
     m.add_class::<config::Fsa>()?;
     m.add_class::<config::RegexConfig>()?;
@@ -500,5 +510,6 @@ fn kbnf(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Vocabulary>()?;
     m.add_class::<Token>()?;
     m.add_function(wrap_pyfunction!(inspect_grammar_py, m)?)?;
+    m.add_function(wrap_pyfunction!(check_grammar_py, m)?)?;
     Ok(())
 }

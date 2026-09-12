@@ -143,6 +143,7 @@ impl Engine {
                 vocabulary,
                 grammar,
                 internal_config.engine_config,
+                internal_config.decode_limits,
             )?)
         } else if Self::check_id_length(&grammar, u8::MAX.into())
             && td <= u8::MAX.into()
@@ -157,6 +158,7 @@ impl Engine {
                 vocabulary,
                 grammar,
                 internal_config.engine_config,
+                internal_config.decode_limits,
             )?)
         } else if Self::check_id_length(&grammar, u16::MAX.into())
             && td <= u16::MAX.into()
@@ -171,6 +173,7 @@ impl Engine {
                 vocabulary,
                 grammar,
                 internal_config.engine_config,
+                internal_config.decode_limits,
             )?)
         } else {
             return Err(CreateEngineError::InvalidInputError);
@@ -192,6 +195,34 @@ macro_rules! match_engine_union {
 impl crate::engine_like::sealed::Sealed for Engine {}
 
 impl Engine {
+    /// Number of entries currently retained in the allowed-token cache.
+    pub fn cache_size(&self) -> usize {
+        match &self.union {
+            EngineUnion::U8U8U8U8U32(engine) => engine.cache_size(),
+            EngineUnion::U8U8U16U16U16(engine) => engine.cache_size(),
+            EngineUnion::U16U16U32U32U32(engine) => engine.cache_size(),
+        }
+    }
+
+    /// Returns `(items in the newest Earley set, items across the whole chart)`.
+    pub fn earley_chart_size(&self) -> (usize, usize) {
+        match &self.union {
+            EngineUnion::U8U8U8U8U32(engine) => engine.earley_chart_size(),
+            EngineUnion::U8U8U16U16U16(engine) => engine.earley_chart_size(),
+            EngineUnion::U16U16U32U32U32(engine) => engine.earley_chart_size(),
+        }
+    }
+
+    /// The decode limits this engine enforces.
+    pub fn decode_limits(&self) -> crate::limits::DecodeLimits {
+        match &self.union {
+            EngineUnion::U8U8U8U8U32(engine) => *engine.decode_limits(),
+            EngineUnion::U8U8U16U16U16(engine) => *engine.decode_limits(),
+            EngineUnion::U16U16U32U32U32(engine) => *engine.decode_limits(),
+        }
+    }
+
+    /// Releases memory held by internal buffers and caches.
     pub fn shrink_to_fit(&mut self) {
         match &mut self.union {
             EngineUnion::U8U8U8U8U32(engine) => {

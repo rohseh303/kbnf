@@ -7,6 +7,7 @@ generate scaled variants so the checked-in corpus stays reviewable.
 - `nested.kbnf`: parser/AST depth pressure.
 - `optional_expansion.kbnf`: EBNF simplification fan-out.
 - `regex_expansion.kbnf`: DFA construction pressure.
+- `nested_repetition.kbnf`: nested counted repetition; NFA size pressure caught by the regex size estimate.
 - `recursive.kbnf`: legal recursion that must remain supported.
 
 The resource policy is deterministic for source, AST, string-table, and simplified

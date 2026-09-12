@@ -54,6 +54,26 @@ pub fn construct_kbnf_syntax_grammar(
     input: &str,
     config: InternalConfig,
 ) -> Result<SimplifiedGrammar, CreateGrammarError> {
+    construct_kbnf_syntax_grammar_with_complexity(input, config).map(|(grammar, _)| grammar)
+}
+
+/// Runs the full hardened construction pipeline and returns only the complexity report.
+///
+/// This parses, validates (including regex compilation), and simplifies the grammar
+/// under the limits in `config` without needing a vocabulary, so a service can admit or
+/// reject a user-supplied grammar in an isolated worker before building an engine.
+pub fn check_grammar(
+    input: &str,
+    config: InternalConfig,
+) -> Result<GrammarComplexity, CreateGrammarError> {
+    construct_kbnf_syntax_grammar_with_complexity(input, config).map(|(_, complexity)| complexity)
+}
+
+/// Like [`construct_kbnf_syntax_grammar`], but also returns the measured complexity.
+pub fn construct_kbnf_syntax_grammar_with_complexity(
+    input: &str,
+    config: InternalConfig,
+) -> Result<(SimplifiedGrammar, GrammarComplexity), CreateGrammarError> {
     let started = std::time::Instant::now();
     config.grammar_limits.check_source(input.len())?;
     config.grammar_limits.check_lexical_nesting(input)?;
@@ -80,7 +100,7 @@ pub fn construct_kbnf_syntax_grammar(
     config
         .grammar_limits
         .check_deadline(started, GrammarPhase::Simplified)?;
-    Ok(grammar)
+    Ok((grammar, complexity))
 }
 /// Helper function to find the maximum state ID from an KBNF grammar.
 /// This is useful for determining [EngineBase](crate::engine_base::EngineBase) and [Grammar](crate::grammar::Grammar)'s generic parameter(TS).

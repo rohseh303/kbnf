@@ -30,6 +30,7 @@ use crate::{
     vocabulary::Vocabulary,
 };
 type EarleySets<TN, TD, TP, TSP, TS> = JaggedArray<EarleyItem<TN, TD, TP, TSP, TS>, Vec<usize>, 2>;
+use crate::limits::DecodeLimits;
 const USIZE_WIDTH: usize = std::mem::size_of::<usize>();
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct EarleyItem<TN, TD, TP, TSP, TS>
@@ -348,6 +349,7 @@ where
     already_predicted_nonterminals: Vec<FixedBitSet>,
     finished: bool,
     config: EngineConfig,
+    decode_limits: DecodeLimits,
 }
 
 impl<TI, TD, TP, TSP, TS> Debug for EngineBase<TI, TD, TP, TSP, TS>
@@ -511,6 +513,7 @@ where
         vocabulary: Arc<Vocabulary>,
         grammar: Arc<Grammar<TI>>,
         config: EngineConfig,
+        decode_limits: DecodeLimits,
     ) -> Result<Self, CreateEngineBaseError> {
         // Verify necessary conditions
         assert!(
@@ -544,6 +547,7 @@ where
             to_be_completed_items,
             already_predicted_nonterminals,
             config,
+            decode_limits,
             postdot_items,
             leo_items: AHashMap::default(),
             finished: false,
@@ -1375,6 +1379,25 @@ where
         self.cache.shrink_to_fit();
     }
 
+    /// Number of entries currently retained in the allowed-token cache.
+    pub fn cache_size(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// Returns `(items in the newest Earley set, items across the whole chart)`.
+    pub fn earley_chart_size(&self) -> (usize, usize) {
+        let newest = self
+            .earley_sets
+            .view::<1, 1>([self.earley_sets.len() - 1])
+            .len();
+        (newest, self.earley_sets.buffer_len())
+    }
+
+    /// The decode limits this engine enforces.
+    pub fn decode_limits(&self) -> &DecodeLimits {
+        &self.decode_limits
+    }
+
     fn accept_byte(
         grammar: &Grammar<TI>,
         earley_sets: &mut EarleySets<TI, TD, TP, TSP, TS>,
@@ -1395,6 +1418,7 @@ where
         ),
         byte: u8,
         skipped_items_indices: &Option<FixedBitSet>,
+        decode_limits: &DecodeLimits,
     ) -> Result<(), crate::engine_like::AcceptTokenError> {
         Self::scan(
             grammar,
@@ -1439,6 +1463,18 @@ where
             already_predicted_nonterminals,
             postdot_items,
         ); // predict the next Earley set
+        let newest_set_items = earley_sets.view::<1, 1>([earley_sets.len() - 1]).len();
+        if !decode_limits.chart_within_limits(newest_set_items, earley_sets.buffer_len()) {
+            Self::revert_change(
+                earley_sets,
+                postdot_items,
+                already_predicted_nonterminals,
+                leo_items,
+                previous_earley_set_length,
+                finished,
+            );
+            return Err(crate::engine_like::AcceptTokenError::ResourceLimitExceeded);
+        }
         Ok(())
     }
 
@@ -1512,6 +1548,7 @@ where
         already_predicted_nonterminals: &mut Vec<FixedBitSet>,
         deduplication_buffer: &mut AHashSet<EarleyItem<TI, TD, TP, TSP, TS>>,
         config: &EngineConfig,
+        decode_limits: &DecodeLimits,
         finished: &mut bool,
         bytes: impl Iterator<Item = u8>,
     ) -> Result<crate::engine_like::AcceptTokenResult, crate::engine_like::AcceptTokenError> {
@@ -1540,6 +1577,7 @@ where
                     },
                     byte,
                     &None,
+                    decode_limits,
                 )?;
             }
         } else {
@@ -1559,6 +1597,7 @@ where
                     |_, _, _, _| {},
                     byte,
                     &None,
+                    decode_limits,
                 )?;
             }
         }
@@ -1644,6 +1683,7 @@ where
             &mut self.already_predicted_nonterminals,
             &mut self.deduplication_buffer,
             &self.config,
+            &self.decode_limits,
             &mut self.finished,
             token.0.iter().copied(),
         )
@@ -1667,6 +1707,7 @@ where
             &mut self.already_predicted_nonterminals,
             &mut self.deduplication_buffer,
             &self.config,
+            &self.decode_limits,
             &mut self.finished,
             bytes.iter().copied(),
         )
@@ -1777,6 +1818,7 @@ where
                     } else {
                         &None
                     },
+                    &self.decode_limits,
                 )
                 .is_err()
                 // The token is rejected
@@ -1802,6 +1844,14 @@ where
         }
         // println!("number of allowed_token_ids after: {:?}", self.allowed_token_ids.count_ones(..));
         if self.config.cache_enabled {
+            if let Some(max_entries) = self.decode_limits.max_cache_entries {
+                if self.cache.len() >= max_entries {
+                    self.cache.clear();
+                }
+                if max_entries == 0 {
+                    return;
+                }
+            }
             self.cache
                 .insert(self.earley_sets.clone(), self.allowed_token_ids.clone());
         }
@@ -1843,6 +1893,9 @@ where
             }
             crate::engine_like::AcceptTokenError::Rejected => {
                 crate::engine_like::UpdateLogitsError::Rejected
+            }
+            crate::engine_like::AcceptTokenError::ResourceLimitExceeded => {
+                crate::engine_like::UpdateLogitsError::ResourceLimitExceeded
             }
         })?;
         if AcceptTokenResult::Finished == result {
