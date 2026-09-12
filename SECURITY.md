@@ -51,5 +51,6 @@ has been produced.
 The `tests/adversarial_grammars` corpus records representative attack shapes, while
 `tests/grammar_limits.rs` verifies early rejection, structural error details,
 backwards compatibility, the hardened happy path, and expansion accounting. The
-`fuzz/grammar_construction` target continuously probes that same hardened path. CI
-uses the checked-in `Cargo.lock` and exercises Rust, Python, and WASM builds.
+`fuzz/grammar_construction` target continuously probes that same hardened path. The
+repository checks in lockfiles for reproducible Rust and fuzz builds; verify the
+Rust suite, Python and WASM features, and fuzz target before release.
