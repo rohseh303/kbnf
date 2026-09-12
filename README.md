@@ -21,6 +21,39 @@ If you are interested in the design and implementation behind this crate, you ma
 - Supports UTF-8 characters in grammar.
 - Embeddable regular expressions.
 
+## Safely accepting custom grammars
+
+The original API remains backwards-compatible and unlimited. In a service that
+accepts grammars from users, opt into the hardened profile so malformed or
+resource-amplifying inputs are rejected before they monopolize an inference worker:
+
+```rust
+use kbnf::{Config, Engine};
+
+let config = Config::hardened();
+let engine = Engine::with_config(user_grammar, vocabulary, config)?;
+```
+
+The profile caps source and AST size, nesting, string tables, regex source and DFA
+memory, estimated EBNF expansion, simplified productions/symbols, and cooperative
+compile time. Each rejection includes its phase, stable resource name, observed
+value, and configured limit. Every limit can be tuned through `Config::grammar_limits`.
+
+Python users get the same policy and a cheap preflight report:
+
+```python
+import kbnf
+
+config = kbnf.Config.hardened()
+complexity = kbnf.inspect_grammar(user_grammar)
+engine = kbnf.InternalEngine(user_grammar, vocabulary, config)
+```
+
+`max_compile_millis` is checked between construction phases; it cannot preempt a
+single regex compiler call. Multi-tenant servers should also compile in an isolated
+worker process with an external timeout and memory limit. See [SECURITY.md](SECURITY.md)
+for the threat model and deployment boundary.
+
 ## Documentation
 
 [Documentation and examples](https://docs.rs/kbnf/).

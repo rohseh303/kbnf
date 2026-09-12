@@ -1,0 +1,2 @@
+start ::= item | item ',' start;
+item ::= #'[a-z]+';

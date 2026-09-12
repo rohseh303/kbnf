@@ -876,6 +876,12 @@ impl Config {
     pub fn new_js() -> Config {
         Config::default()
     }
+
+    /// Creates a configuration with conservative limits for user-supplied grammars.
+    #[wasm_bindgen(js_name = hardened)]
+    pub fn hardened_js() -> Config {
+        Config::hardened()
+    }
 }
 
 #[cfg(feature = "python")]
@@ -885,5 +891,29 @@ impl Config {
     #[new]
     pub fn new_py() -> Config {
         Config::default()
+    }
+
+    /// Creates a configuration with conservative limits for user-supplied grammars.
+    #[staticmethod]
+    #[pyo3(name = "hardened")]
+    pub fn hardened_py() -> Config {
+        Config::hardened()
+    }
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl crate::limits::GrammarLimits {
+    /// Creates a new unlimited resource policy.
+    #[new]
+    pub fn new_py() -> Self {
+        Self::default()
+    }
+
+    /// Creates the conservative multi-tenant resource policy.
+    #[staticmethod]
+    #[pyo3(name = "hardened")]
+    pub fn hardened_py() -> Self {
+        Self::hardened()
     }
 }

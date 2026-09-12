@@ -228,6 +228,9 @@ where
 #[derive(Debug, thiserror::Error)]
 /// The error type for errors in Grammar creation.
 pub enum CreateGrammarError {
+    #[error("{0}")]
+    /// Error caused by a configured grammar resource limit.
+    ResourceLimitError(#[from] crate::limits::GrammarLimitError),
     #[error("KBNF parsing error: {0}")]
     /// Error due to parsing the KBNF grammar.
     ParsingError(#[from] nom::Err<nom::error::VerboseError<String>>), // We have to clone the str to remove lifetime so pyo3 works later

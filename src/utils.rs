@@ -9,20 +9,12 @@ use nom::error::VerboseError;
 
 use crate::config::InternalConfig;
 use crate::grammar::CreateGrammarError;
+use crate::limits::{GrammarComplexity, GrammarPhase};
 
-pub(crate) type ByteSet = FixedBitSet<{ get_nblock(u8::MAX as usize) }>;
-#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::Display)]
-pub(crate) enum FsaStateStatus {
-    Accept,
-    Reject,
-    InProgress,
-}
-/// Helper function to construct a simplified grammar from an KBNF grammar string.
-pub fn construct_kbnf_syntax_grammar(
+fn parse_grammar(
     input: &str,
-    config: InternalConfig,
-) -> Result<SimplifiedGrammar, CreateGrammarError> {
-    let grammar = kbnf_syntax::get_grammar(input).map_err(|e| match e {
+) -> Result<kbnf_syntax::grammar::Grammar, nom::Err<VerboseError<String>>> {
+    kbnf_syntax::get_grammar(input).map_err(|e| match e {
         nom::Err::Error(e) => nom::Err::Error(VerboseError {
             errors: e
                 .errors
@@ -38,13 +30,56 @@ pub fn construct_kbnf_syntax_grammar(
                 .collect::<Vec<_>>(),
         }),
         nom::Err::Incomplete(e) => nom::Err::Incomplete(e),
-    })?;
+    })
+}
+
+/// Parse a grammar and return deterministic pre-compilation complexity metrics.
+///
+/// This does not compile regular expressions or construct an engine, so callers can
+/// inspect user-supplied grammars before committing the more expensive resources.
+pub fn inspect_grammar(input: &str) -> Result<GrammarComplexity, CreateGrammarError> {
+    let grammar = parse_grammar(input)?;
+    Ok(GrammarComplexity::from_parsed(input, &grammar))
+}
+
+pub(crate) type ByteSet = FixedBitSet<{ get_nblock(u8::MAX as usize) }>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::Display)]
+pub(crate) enum FsaStateStatus {
+    Accept,
+    Reject,
+    InProgress,
+}
+/// Helper function to construct a simplified grammar from an KBNF grammar string.
+pub fn construct_kbnf_syntax_grammar(
+    input: &str,
+    config: InternalConfig,
+) -> Result<SimplifiedGrammar, CreateGrammarError> {
+    let started = std::time::Instant::now();
+    config.grammar_limits.check_source(input.len())?;
+    config.grammar_limits.check_lexical_nesting(input)?;
+    config
+        .grammar_limits
+        .check_deadline(started, GrammarPhase::Source)?;
+    let grammar = parse_grammar(input)?;
+    let complexity = GrammarComplexity::from_parsed(input, &grammar);
+    config.grammar_limits.check_parsed(&complexity)?;
+    config
+        .grammar_limits
+        .check_deadline(started, GrammarPhase::Parsed)?;
     let grammar = grammar.validate_grammar(&config.start_nonterminal, config.regex_config)?;
+    config
+        .grammar_limits
+        .check_deadline(started, GrammarPhase::Validated)?;
     let grammar = grammar.simplify_grammar(
         config.compression_config,
         &kbnf_regex_automata::util::start::Config::new()
             .anchored(kbnf_regex_automata::Anchored::Yes),
     );
+    let complexity = complexity.add_simplified(&grammar);
+    config.grammar_limits.check_simplified(&complexity)?;
+    config
+        .grammar_limits
+        .check_deadline(started, GrammarPhase::Simplified)?;
     Ok(grammar)
 }
 /// Helper function to find the maximum state ID from an KBNF grammar.

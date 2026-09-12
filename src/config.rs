@@ -5,6 +5,7 @@ use pyo3::pyclass;
 use serde::{Deserialize, Serialize};
 
 use crate::engine::EngineConfig;
+use crate::limits::GrammarLimits;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 #[derive(Debug, Clone)]
@@ -18,6 +19,8 @@ pub struct InternalConfig {
     pub engine_config: EngineConfig,
     /// The start nonterminal of the grammar.
     pub start_nonterminal: String,
+    /// Resource limits for user-supplied grammars.
+    pub grammar_limits: GrammarLimits,
 }
 /// The configuration of the [`Engine`](crate::engine::Engine) struct. This should suffice most scenarios.
 #[cfg_attr(feature = "python", pyclass)]
@@ -40,6 +43,10 @@ pub struct Config {
     pub expected_output_length: usize,
     /// The configuration of the terminals compression.
     pub compression_config: CompressionConfig,
+    /// Resource limits applied during grammar construction.
+    /// The default is unlimited for backwards compatibility.
+    #[serde(default)]
+    pub grammar_limits: GrammarLimits,
 }
 /// The type of the Finite State Automaton to be used.
 #[cfg_attr(feature = "python", pyclass(eq, eq_int))]
@@ -97,10 +104,19 @@ impl Default for Config {
             start_nonterminal: "start".to_string(),
             compression_config: CompressionConfig { min_terminals: 5 },
             expected_output_length: u32::MAX as usize,
+            grammar_limits: GrammarLimits::default(),
         }
     }
 }
 impl Config {
+    /// Creates a configuration with conservative limits for user-supplied grammars.
+    pub fn hardened() -> Self {
+        let mut config = Self::default();
+        config.grammar_limits = GrammarLimits::hardened();
+        config.regex_config.max_memory_usage = Some(67_108_864);
+        config
+    }
+
     /// Converts the configuration to the internal configuration.
     pub fn internal_config(self) -> InternalConfig {
         let regex_config = match self.regex_config.fsa_type {
@@ -121,6 +137,7 @@ impl Config {
             compression_config,
             engine_config: self.engine_config,
             start_nonterminal: self.start_nonterminal,
+            grammar_limits: self.grammar_limits,
         }
     }
 }
