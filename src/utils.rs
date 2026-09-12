@@ -11,10 +11,38 @@ use crate::config::InternalConfig;
 use crate::grammar::CreateGrammarError;
 use crate::limits::{GrammarComplexity, GrammarPhase};
 
-fn parse_grammar(
-    input: &str,
-) -> Result<kbnf_syntax::grammar::Grammar, nom::Err<VerboseError<String>>> {
-    kbnf_syntax::get_grammar(input).map_err(|e| match e {
+/// Runs one construction phase, converting a panic inside the (third-party) grammar
+/// machinery into [`CreateGrammarError::InternalPanic`] instead of unwinding into the caller.
+///
+/// The default panic hook still logs the panic to stderr; the important property is that
+/// a hostile grammar cannot terminate an inference worker or escape through FFI.
+fn guard_phase<T>(
+    phase: GrammarPhase,
+    body: impl FnOnce() -> T,
+) -> Result<T, CreateGrammarError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).map_err(|payload| {
+        let message = if let Some(message) = payload.downcast_ref::<&str>() {
+            (*message).to_string()
+        } else if let Some(message) = payload.downcast_ref::<String>() {
+            message.clone()
+        } else {
+            "non-string panic payload".to_string()
+        };
+        CreateGrammarError::InternalPanic { phase, message }
+    })
+}
+
+fn parse_grammar(input: &str) -> Result<kbnf_syntax::grammar::Grammar, CreateGrammarError> {
+    if let Some(offset) = crate::limits::find_unterminated_comment(input) {
+        // The upstream parser never terminates on this input; refuse it up front.
+        return Err(CreateGrammarError::ParsingError(nom::Err::Failure(VerboseError {
+            errors: vec![(
+                format!("unterminated comment `(*` at byte {offset}"),
+                nom::error::VerboseErrorKind::Context("unterminated comment"),
+            )],
+        })));
+    }
+    guard_phase(GrammarPhase::Parsed, || kbnf_syntax::get_grammar(input))?.map_err(|e| match e {
         nom::Err::Error(e) => nom::Err::Error(VerboseError {
             errors: e
                 .errors
@@ -31,6 +59,7 @@ fn parse_grammar(
         }),
         nom::Err::Incomplete(e) => nom::Err::Incomplete(e),
     })
+    .map_err(CreateGrammarError::from)
 }
 
 /// Parse a grammar and return deterministic pre-compilation complexity metrics.
@@ -76,7 +105,7 @@ pub fn construct_kbnf_syntax_grammar_with_complexity(
 ) -> Result<(SimplifiedGrammar, GrammarComplexity), CreateGrammarError> {
     let started = std::time::Instant::now();
     config.grammar_limits.check_source(input.len())?;
-    config.grammar_limits.check_lexical_nesting(input)?;
+    config.grammar_limits.check_lexical(input)?;
     config
         .grammar_limits
         .check_deadline(started, GrammarPhase::Source)?;
@@ -86,15 +115,19 @@ pub fn construct_kbnf_syntax_grammar_with_complexity(
     config
         .grammar_limits
         .check_deadline(started, GrammarPhase::Parsed)?;
-    let grammar = grammar.validate_grammar(&config.start_nonterminal, config.regex_config)?;
+    let grammar = guard_phase(GrammarPhase::Validated, || {
+        grammar.validate_grammar(&config.start_nonterminal, config.regex_config)
+    })??;
     config
         .grammar_limits
         .check_deadline(started, GrammarPhase::Validated)?;
-    let grammar = grammar.simplify_grammar(
-        config.compression_config,
-        &kbnf_regex_automata::util::start::Config::new()
-            .anchored(kbnf_regex_automata::Anchored::Yes),
-    );
+    let grammar = guard_phase(GrammarPhase::Simplified, || {
+        grammar.simplify_grammar(
+            config.compression_config,
+            &kbnf_regex_automata::util::start::Config::new()
+                .anchored(kbnf_regex_automata::Anchored::Yes),
+        )
+    })?;
     let complexity = complexity.add_simplified(&grammar);
     config.grammar_limits.check_simplified(&complexity)?;
     config

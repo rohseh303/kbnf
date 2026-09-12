@@ -234,6 +234,15 @@ pub enum CreateGrammarError {
     #[error("KBNF parsing error: {0}")]
     /// Error due to parsing the KBNF grammar.
     ParsingError(#[from] nom::Err<nom::error::VerboseError<String>>), // We have to clone the str to remove lifetime so pyo3 works later
+    #[error("grammar construction panicked during {phase}: {message}")]
+    /// A panic inside the grammar parser, validator, or simplifier was caught and converted
+    /// into an error so that a malformed grammar cannot take down the host process.
+    InternalPanic {
+        /// Construction phase in which the panic occurred.
+        phase: crate::limits::GrammarPhase,
+        /// The panic message, when it was a string.
+        message: String,
+    },
     #[error("KBNF semantics error: {0}")]
     /// Error due to semantic errors in the KBNF grammar.
     SemanticError(#[from] Box<kbnf_syntax::semantic_error::SemanticError>),

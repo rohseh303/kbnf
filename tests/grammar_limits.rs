@@ -268,3 +268,173 @@ fn regex_size_estimate_scales_with_repetition_bounds() {
     assert!(complexity.total_regex_size_estimate > complexity.regex_size_estimate);
     compile_with_limits("start ::= #'[a-z]{1,64}';", GrammarLimits::hardened()).unwrap();
 }
+
+/// Dependency-free randomized robustness tests (a fixed-seed xorshift keeps them deterministic).
+mod randomized {
+    use super::*;
+
+    struct XorShift(u64);
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn pick<'a>(&mut self, items: &[&'a str]) -> &'a str {
+            items[(self.next() % items.len() as u64) as usize]
+        }
+    }
+
+    const FRAGMENTS: &[&str] = &[
+        "start", "::=", ";", "|", "(", ")", "?", "*", "+", "'a'", "'b'", "\"c\"", "#'[a-z]+'",
+        "#'(a{1,50}){1,50}'", "#e'x'", "#substrs'abc'", "item", "\n", " ", "(*", "*)", "\\", "'",
+        "start ::= item;", "item ::= 'x' | item ',' item;", "#'.{0,4096}'", "½©", "𝏾", "'񆃫'",
+        "#'[^\\u0000-\\u001f]'", "{", "}", "[", "]", "::", "=",
+    ];
+
+    /// Hardened construction must return an error, never panic, whatever the input looks like.
+    #[test]
+    fn hardened_construction_never_panics_on_fragment_soup() {
+        let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+        for _ in 0..2_000 {
+            let len = 1 + (rng.next() % 40) as usize;
+            let grammar: Vec<&str> = (0..len).map(|_| rng.pick(FRAGMENTS)).collect();
+            let grammar = grammar.join(" ");
+            let mut config = Config::hardened();
+            config.grammar_limits.max_source_bytes = Some(16 * 1024);
+            let _ = kbnf::utils::inspect_grammar(&grammar);
+            let _ = construct_kbnf_syntax_grammar(&grammar, config.internal_config());
+        }
+    }
+
+    /// Arbitrary Unicode text, including multi-byte characters at every position.
+    #[test]
+    fn hardened_construction_never_panics_on_unicode_noise() {
+        let alphabet: Vec<char> = "ab'\"#:=;|()?*+ \n\\½©𝏾񆃫[]{}^$.-".chars().collect();
+        let mut rng = XorShift(0xD1B5_4A32_D192_ED03);
+        for _ in 0..2_000 {
+            let len = (rng.next() % 64) as usize;
+            let grammar: String = (0..len)
+                .map(|_| alphabet[(rng.next() % alphabet.len() as u64) as usize])
+                .collect();
+            let _ = kbnf::utils::inspect_grammar(&grammar);
+            let _ = construct_kbnf_syntax_grammar(&grammar, Config::hardened().internal_config());
+        }
+    }
+}
+
+#[test]
+fn parser_panics_become_structured_errors() {
+    // kbnf-syntax 0.5.3 slices `&input[..2]` while skipping comments, which panics when the
+    // grammar starts with a multi-byte character. The fork must report that, not unwind.
+    for grammar in ["\u{1d3fe}.=\\*", "\u{460eb}\u{3bc0a}", "'\u{460eb}' } item"] {
+        match kbnf::utils::inspect_grammar(grammar) {
+            Err(CreateGrammarError::InternalPanic { phase, message }) => {
+                assert_eq!(phase, GrammarPhase::Parsed);
+                assert!(message.contains("char boundary"), "{message}");
+            }
+            Err(CreateGrammarError::ParsingError(_)) => {}
+            other => panic!("expected an error for {grammar:?}, got {other:?}"),
+        }
+        assert!(compile_with_limits(grammar, GrammarLimits::hardened()).is_err());
+    }
+}
+
+#[test]
+fn unterminated_comments_are_rejected_instead_of_hanging() {
+    // kbnf-syntax 0.5.3 loops forever on an unclosed `(*`; the fork must refuse it quickly.
+    let started = std::time::Instant::now();
+    for grammar in ["(*", "(* never closed", "start ::= 'a'; (* trailing", "(*)", "(**"] {
+        match kbnf::utils::inspect_grammar(grammar) {
+            Err(CreateGrammarError::ParsingError(error)) => {
+                assert!(error.to_string().contains("unterminated comment"), "{error}");
+            }
+            other => panic!("expected parsing error for {grammar:?}, got {other:?}"),
+        }
+        assert!(compile_with_limits(grammar, GrammarLimits::hardened()).is_err());
+    }
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+
+    kbnf::utils::inspect_grammar("(* ok *) start ::= 'a'; (* also ok *)").unwrap();
+    kbnf::utils::inspect_grammar("start ::= '(*' | \"(*\" | #'\\\\(\\\\*';").unwrap();
+    assert_eq!(kbnf::limits::find_unterminated_comment("'(*' (* x *)"), None);
+    assert_eq!(kbnf::limits::find_unterminated_comment("a (* b"), Some(2));
+}
+
+#[test]
+fn long_alternation_chains_are_bounded_lexically_and_structurally() {
+    let chain = format!(
+        "start ::= {};",
+        (0..5_000).map(|i| format!("'a{i}'")).collect::<Vec<_>>().join(" | ")
+    );
+    let started = std::time::Instant::now();
+    assert_limit(
+        compile_with_limits(&chain, GrammarLimits::hardened()),
+        GrammarPhase::Source,
+        "alternatives_per_rule",
+        4_097,
+        4_096,
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+
+    // Alternation chains are not nesting: a 300-way enum has a shallow AST.
+    let enum_rule = format!(
+        "start ::= {};",
+        (0..300).map(|i| format!("'e{i}'")).collect::<Vec<_>>().join(" | ")
+    );
+    let complexity = kbnf::utils::inspect_grammar(&enum_rule).unwrap();
+    assert_eq!(complexity.max_alternatives, 300);
+    assert!(complexity.nesting_depth <= 3, "depth {}", complexity.nesting_depth);
+    compile_with_limits(&enum_rule, GrammarLimits::hardened()).unwrap();
+
+    let limits = GrammarLimits {
+        max_alternatives_per_rule: Some(100),
+        ..Default::default()
+    };
+    let inside_quotes = "start ::= '|||||' | #'a|b|c';";
+    compile_with_limits(inside_quotes, limits).unwrap();
+}
+
+#[test]
+fn nullable_nonterminals_are_counted_in_the_expansion_estimate() {
+    let grammar = format!("start ::= {}; a ::= 'x'?;", vec!["a"; 20].join(" "));
+    let complexity = kbnf::utils::inspect_grammar(&grammar).unwrap();
+    assert!(complexity.simplification_expansion >= 1 << 20, "{}", complexity.simplification_expansion);
+    let limits = GrammarLimits {
+        max_simplification_expansion: Some(10_000),
+        ..Default::default()
+    };
+    match compile_with_limits(&grammar, limits) {
+        Err(CreateGrammarError::ResourceLimitError(error)) => {
+            assert_eq!(error.resource, "simplification_expansion");
+            assert_eq!(error.phase, GrammarPhase::Parsed);
+        }
+        other => panic!("expected expansion limit error, got {other:?}"),
+    }
+    // Indirect nullability through an empty terminal and a nullable chain.
+    let indirect = "start ::= b b b b b b b b b b b b; b ::= c; c ::= '' | 'y';";
+    assert!(kbnf::utils::inspect_grammar(indirect).unwrap().simplification_expansion >= 1 << 12);
+    // A grammar with no nullable symbols keeps a linear estimate.
+    let linear = format!("start ::= {}; a ::= 'x';", vec!["a"; 20].join(" "));
+    assert!(kbnf::utils::inspect_grammar(&linear).unwrap().simplification_expansion < 64);
+}
+
+#[test]
+fn nested_counted_loops_are_penalised_but_flat_repetition_is_not() {
+    // KBNF unescapes the string once, so each regex backslash is written twice.
+    let json_string = r#"start ::= #'"([^\\\\"]|\\\\["\\\\/bfnrt]|\\\\u[0-9A-Fa-f]{4}){0,1024}"';"#;
+    compile_with_limits(json_string, GrammarLimits::hardened()).unwrap();
+    compile_with_limits("start ::= #'.{0,4096}';", GrammarLimits::hardened()).unwrap();
+    compile_with_limits("start ::= #'([0-9]{3}-){200}';", GrammarLimits::hardened()).unwrap();
+    for hostile in ["start ::= #'(a{1,100}){1,100}';", "start ::= #'([a-z]{1,64}){1,64}';"] {
+        match compile_with_limits(hostile, GrammarLimits::hardened()) {
+            Err(CreateGrammarError::ResourceLimitError(error)) => {
+                assert_eq!(error.resource, "regex_size_estimate", "{hostile}");
+            }
+            other => panic!("expected regex size rejection for {hostile}, got {other:?}"),
+        }
+    }
+}

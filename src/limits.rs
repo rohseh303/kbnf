@@ -26,7 +26,16 @@ pub struct GrammarLimits {
     /// Maximum number of nodes in the parsed grammar AST.
     pub max_ast_nodes: Option<usize>,
     /// Maximum nesting depth in the parsed grammar AST.
+    ///
+    /// Chains of the same operator (`a | b | c`, `a b c`) count as one level; this bounds
+    /// structural nesting such as parenthesised groups.
     pub max_nesting_depth: Option<usize>,
+    /// Maximum alternatives (`|`) in any one rule, checked lexically before parsing and
+    /// again on the AST.
+    ///
+    /// The upstream parser recurses once per alternative and overflows its stack at roughly
+    /// 32,000 alternatives, so this must stay well below that.
+    pub max_alternatives_per_rule: Option<usize>,
     /// Maximum number of unique nonterminals.
     pub max_nonterminals: Option<usize>,
     /// Maximum number of unique terminal strings.
@@ -70,6 +79,7 @@ impl GrammarLimits {
             max_source_bytes: Some(1_048_576),
             max_ast_nodes: Some(100_000),
             max_nesting_depth: Some(128),
+            max_alternatives_per_rule: Some(4_096),
             max_nonterminals: Some(4_096),
             max_terminals: Some(16_384),
             max_regexes: Some(1_024),
@@ -146,8 +156,10 @@ pub struct GrammarComplexity {
     pub source_bytes: usize,
     /// Number of parsed AST nodes.
     pub ast_nodes: usize,
-    /// Maximum parsed AST nesting depth.
+    /// Maximum parsed AST nesting depth (operator chains count as one level).
     pub nesting_depth: usize,
+    /// Alternatives in the rule with the most alternatives.
+    pub max_alternatives: usize,
     /// Number of unique nonterminals.
     pub nonterminals: usize,
     /// Number of unique terminals.
@@ -180,8 +192,11 @@ impl GrammarComplexity {
     pub(crate) fn from_parsed(source: &str, grammar: &ParsedGrammar) -> Self {
         let mut ast_nodes = 0usize;
         let mut nesting_depth = 0usize;
+        let mut max_alternatives = 0usize;
         let mut simplification_expansion = 0usize;
+        let nullable = nullable_nonterminals(grammar);
         for expression in &grammar.expressions {
+            let mut alternations = 0usize;
             let mut stack = vec![(&expression.rhs, 1usize)];
             while let Some((node, depth)) = stack.pop() {
                 ast_nodes = ast_nodes.saturating_add(1);
@@ -193,9 +208,20 @@ impl GrammarComplexity {
                     NodeWithID::RegexExt(node, _) | NodeWithID::Group(node) => {
                         stack.push((node, depth.saturating_add(1)));
                     }
-                    NodeWithID::Symbol(lhs, _, rhs) => {
-                        stack.push((lhs, depth.saturating_add(1)));
-                        stack.push((rhs, depth.saturating_add(1)));
+                    NodeWithID::Symbol(lhs, kind, rhs) => {
+                        if matches!(kind, SymbolKind::Alternation) {
+                            alternations = alternations.saturating_add(1);
+                        }
+                        // A chain of the same operator is one syntactic level.
+                        for child in [lhs.as_ref(), rhs.as_ref()] {
+                            let same_operator = matches!(
+                                (child, kind),
+                                (NodeWithID::Symbol(_, SymbolKind::Alternation, _), SymbolKind::Alternation)
+                                    | (NodeWithID::Symbol(_, SymbolKind::Concatenation, _), SymbolKind::Concatenation)
+                            );
+                            let child_depth = if same_operator { depth } else { depth.saturating_add(1) };
+                            stack.push((child, child_depth));
+                        }
                     }
                     NodeWithID::Terminal(_)
                     | NodeWithID::RegexString(_)
@@ -206,8 +232,9 @@ impl GrammarComplexity {
                     | NodeWithID::Unknown => {}
                 }
             }
-            simplification_expansion =
-                simplification_expansion.saturating_add(Self::expansion_estimate(&expression.rhs));
+            max_alternatives = max_alternatives.max(alternations.saturating_add(1));
+            simplification_expansion = simplification_expansion
+                .saturating_add(Self::expansion_estimate(&expression.rhs, &nullable));
         }
 
         let literal_bytes = grammar
@@ -244,6 +271,7 @@ impl GrammarComplexity {
             source_bytes: source.len(),
             ast_nodes,
             nesting_depth,
+            max_alternatives,
             nonterminals: grammar.interned_strings.nonterminals.len(),
             terminals: grammar.interned_strings.terminals.len(),
             regexes: grammar.interned_strings.regex_strings.len(),
@@ -258,7 +286,15 @@ impl GrammarComplexity {
         }
     }
 
-    fn expansion_estimate(root: &NodeWithID) -> usize {
+    fn expansion_estimate<S: std::hash::Hash + Eq>(
+        root: &NodeWithID,
+        nullable: &ahash::AHashSet<S>,
+    ) -> usize
+    where
+        S: std::borrow::Borrow<S>,
+        for<'a> &'a S: From<&'a S>,
+        NodeWithID: NullableLookup<S>,
+    {
         enum Visit<'a> {
             Enter(&'a NodeWithID),
             Exit(&'a NodeWithID),
@@ -312,6 +348,11 @@ impl GrammarComplexity {
                             SymbolKind::Alternation => lhs.saturating_add(rhs),
                         });
                     }
+                    // Nullable nonterminals are eliminated by duplicating every production
+                    // that references them, so each reference doubles the expansion.
+                    node @ NodeWithID::Nonterminal(_) => {
+                        values.push(if node.is_nullable_reference(nullable) { 2 } else { 1 })
+                    }
                     _ => values.push(1),
                 },
             }
@@ -337,6 +378,47 @@ impl GrammarComplexity {
     }
 }
 
+/// Returns the byte offset of a `(*` comment opener that is never closed by `*)`.
+///
+/// `kbnf-syntax` 0.5.3 skips comments with `opt(delimited(tag("(*"), take_until("*)"), ..))`
+/// inside a `while input.starts_with("(*")` loop; when the closing `*)` is missing the
+/// optional parser makes no progress and the loop never terminates. Quoted terminals and
+/// regexes are skipped so `'(*'` stays a legal literal.
+pub fn find_unterminated_comment(input: &str) -> Option<usize> {
+    let bytes = input.as_bytes();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == active_quote {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'\'' || byte == b'"' {
+            quote = Some(byte);
+            index += 1;
+            continue;
+        }
+        if byte == b'(' && bytes.get(index + 1) == Some(&b'*') {
+            match input[index + 2..].find("*)") {
+                Some(close) => index += 2 + close + 2,
+                None => return Some(index),
+            }
+            continue;
+        }
+        index += 1;
+    }
+    None
+}
+
 /// Estimates the Thompson NFA size of a regular expression from its parsed HIR.
 ///
 /// Sub-expression sizes are multiplied by counted repetition bounds, so nested counted
@@ -344,17 +426,23 @@ impl GrammarComplexity {
 /// the parser rejects contribute `0`; grammar validation reports their syntax error later.
 pub fn regex_size_estimate(pattern: &str) -> usize {
     match regex_syntax::ParserBuilder::new().build().parse(pattern) {
-        Ok(hir) => hir_size(&hir),
+        Ok(hir) => hir_size(&hir).0,
         Err(_) => 0,
     }
 }
 
-fn hir_size(hir: &regex_syntax::hir::Hir) -> usize {
+/// Counted repetitions with at least this bound are treated as loops whose nesting
+/// multiplies determinization cost (`(a{1,100}){1,100}` takes seconds; `\u[0-9a-f]{4}`
+/// inside a loop does not).
+const NESTED_LOOP_THRESHOLD: usize = 8;
+
+/// Returns `(estimated size, largest counted-repetition bound inside)`.
+fn hir_size(hir: &regex_syntax::hir::Hir) -> (usize, usize) {
     use regex_syntax::hir::HirKind;
     match hir.kind() {
-        HirKind::Empty => 1,
-        HirKind::Literal(literal) => literal.0.len().max(1),
-        HirKind::Class(_) | HirKind::Look(_) => 1,
+        HirKind::Empty => (1, 0),
+        HirKind::Literal(literal) => (literal.0.len().max(1), 0),
+        HirKind::Class(_) | HirKind::Look(_) => (1, 0),
         HirKind::Capture(capture) => hir_size(&capture.sub),
         HirKind::Repetition(repetition) => {
             let bound = match repetition.max {
@@ -362,14 +450,21 @@ fn hir_size(hir: &regex_syntax::hir::Hir) -> usize {
                 None => (repetition.min as usize).saturating_add(1),
             }
             .max(1);
-            hir_size(&repetition.sub)
-                .saturating_mul(bound)
-                .saturating_add(1)
+            let (sub_size, inner_loop) = hir_size(&repetition.sub);
+            let penalty = if inner_loop >= NESTED_LOOP_THRESHOLD && bound >= NESTED_LOOP_THRESHOLD {
+                inner_loop
+            } else {
+                1
+            };
+            (
+                sub_size.saturating_mul(bound).saturating_mul(penalty).saturating_add(1),
+                bound.max(inner_loop),
+            )
         }
-        HirKind::Concat(parts) | HirKind::Alternation(parts) => parts
-            .iter()
-            .map(hir_size)
-            .fold(1usize, usize::saturating_add),
+        HirKind::Concat(parts) | HirKind::Alternation(parts) => parts.iter().map(hir_size).fold(
+            (1usize, 0usize),
+            |(size, largest), (part_size, part_loop)| (size.saturating_add(part_size), largest.max(part_loop)),
+        ),
     }
 }
 
@@ -457,6 +552,12 @@ impl GrammarLimits {
             "nesting_depth",
             complexity.nesting_depth,
             self.max_nesting_depth,
+        )?;
+        Self::check_one(
+            phase,
+            "alternatives_per_rule",
+            complexity.max_alternatives,
+            self.max_alternatives_per_rule,
         )?;
         Self::check_one(
             phase,
@@ -554,13 +655,16 @@ impl GrammarLimits {
         Ok(())
     }
 
-    pub(crate) fn check_lexical_nesting(&self, input: &str) -> Result<(), GrammarLimitError> {
-        let Some(limit) = self.max_nesting_depth else {
+    pub(crate) fn check_lexical(&self, input: &str) -> Result<(), GrammarLimitError> {
+        if self.max_nesting_depth.is_none() && self.max_alternatives_per_rule.is_none() {
             return Ok(());
-        };
+        }
+        let limit = self.max_nesting_depth.unwrap_or(usize::MAX);
+        let alternatives_limit = self.max_alternatives_per_rule.unwrap_or(usize::MAX);
         let bytes = input.as_bytes();
         let mut depth = 0usize;
         let mut max_depth = 0usize;
+        let mut alternatives = 1usize;
         let mut quote = None;
         let mut escaped = false;
         let mut comment_depth = 0usize;
@@ -613,9 +717,119 @@ impl GrammarLimits {
                 }
             } else if byte == b')' {
                 depth = depth.saturating_sub(1);
+            } else if byte == b'|' {
+                alternatives = alternatives.saturating_add(1);
+                if alternatives > alternatives_limit {
+                    return Err(GrammarLimitError {
+                        phase: GrammarPhase::Source,
+                        resource: "alternatives_per_rule",
+                        observed: alternatives,
+                        limit: alternatives_limit,
+                    });
+                }
+            } else if byte == b';' {
+                alternatives = 1;
             }
             index += 1;
         }
         Ok(())
     }
+}
+
+/// Looks up whether a `Nonterminal` node refers to a nullable nonterminal.
+pub(crate) trait NullableLookup<S> {
+    fn is_nullable_reference(&self, nullable: &ahash::AHashSet<S>) -> bool;
+}
+
+impl NullableLookup<string_interner::symbol::SymbolU32> for NodeWithID {
+    fn is_nullable_reference(
+        &self,
+        nullable: &ahash::AHashSet<string_interner::symbol::SymbolU32>,
+    ) -> bool {
+        matches!(self, NodeWithID::Nonterminal(id) if nullable.contains(id))
+    }
+}
+
+/// Whether `root` can derive the empty string, given the nonterminals already known nullable.
+fn node_nullable(
+    root: &NodeWithID,
+    grammar: &ParsedGrammar,
+    nullable: &ahash::AHashSet<string_interner::symbol::SymbolU32>,
+) -> bool {
+    enum Visit<'a> {
+        Enter(&'a NodeWithID),
+        Exit(&'a NodeWithID),
+    }
+    let mut visits = vec![Visit::Enter(root)];
+    let mut values: Vec<bool> = Vec::new();
+    while let Some(visit) = visits.pop() {
+        match visit {
+            Visit::Enter(node) => {
+                visits.push(Visit::Exit(node));
+                match node {
+                    NodeWithID::Multiple(nodes) => visits.extend(nodes.iter().rev().map(Visit::Enter)),
+                    NodeWithID::RegexExt(node, _) | NodeWithID::Group(node) => visits.push(Visit::Enter(node)),
+                    NodeWithID::Symbol(lhs, _, rhs) => {
+                        visits.push(Visit::Enter(rhs));
+                        visits.push(Visit::Enter(lhs));
+                    }
+                    _ => {}
+                }
+            }
+            Visit::Exit(node) => match node {
+                NodeWithID::Multiple(nodes) => {
+                    let start = values.len().saturating_sub(nodes.len());
+                    let value = values[start..].iter().all(|nullable| *nullable);
+                    values.truncate(start);
+                    values.push(value);
+                }
+                NodeWithID::RegexExt(_, kind) => {
+                    let child = values.pop().unwrap_or(false);
+                    values.push(match kind {
+                        RegexExtKind::Optional | RegexExtKind::Repeat0 => true,
+                        RegexExtKind::Repeat1 => child,
+                    });
+                }
+                NodeWithID::Group(_) => {}
+                NodeWithID::Symbol(_, kind, _) => {
+                    let rhs = values.pop().unwrap_or(false);
+                    let lhs = values.pop().unwrap_or(false);
+                    values.push(match kind {
+                        SymbolKind::Concatenation => lhs && rhs,
+                        SymbolKind::Alternation => lhs || rhs,
+                    });
+                }
+                NodeWithID::Nonterminal(id) => values.push(nullable.contains(id)),
+                NodeWithID::Terminal(id) => values.push(
+                    grammar
+                        .interned_strings
+                        .terminals
+                        .resolve(*id)
+                        .is_some_and(str::is_empty),
+                ),
+                _ => values.push(false),
+            },
+        }
+    }
+    values.pop().unwrap_or(false)
+}
+
+/// Computes the nullable nonterminals of a parsed grammar by fixpoint iteration.
+fn nullable_nonterminals(
+    grammar: &ParsedGrammar,
+) -> ahash::AHashSet<string_interner::symbol::SymbolU32> {
+    let mut nullable = ahash::AHashSet::default();
+    let mut changed = true;
+    let mut rounds = 0usize;
+    while changed && rounds <= grammar.expressions.len() {
+        changed = false;
+        rounds += 1;
+        for expression in &grammar.expressions {
+            if !nullable.contains(&expression.lhs) && node_nullable(&expression.rhs, grammar, &nullable) {
+                nullable.insert(expression.lhs);
+                changed = true;
+            }
+        }
+    }
+    nullable
 }

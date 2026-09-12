@@ -9,15 +9,31 @@ Treat an arbitrary grammar like an untrusted query, not like inert configuration
 
 `Config::hardened()` and `kbnf.Config.hardened()` install conservative defaults for:
 
-- source bytes and lexical nesting, checked before parsing;
-- parsed AST nodes/depth and interned nonterminal, terminal, regex, and substring counts;
+- source bytes, lexical nesting, and alternatives per rule, checked before parsing (the
+  upstream parser recurses once per alternative and per parenthesis level and overflows
+  its stack near 32,000 alternatives or 16,000 nested groups);
+- parsed AST nodes/depth (operator chains count as one level), alternatives per rule,
+  and interned nonterminal, terminal, regex, and substring counts;
 - terminal/substring bytes, per-regex bytes, and total regex bytes;
 - an estimated regex NFA size (sub-expression sizes multiplied by counted repetition
-  bounds), per regex and in total, checked before any regex is compiled;
-- a saturating EBNF simplification-expansion estimate, checked before simplification;
+  bounds, with nested counted loops penalised because they dominate determinization
+  cost), per regex and in total, checked before any regex is compiled;
+- a saturating EBNF simplification-expansion estimate that follows nullable
+  nonterminals across rules (each reference to a nullable nonterminal doubles the
+  productions the simplifier emits), checked before simplification;
 - actual simplified production and symbol counts;
 - regex DFA memory through the existing regex compiler limit; and
 - a cooperative wall-clock deadline checked between construction phases.
+
+Panics raised inside the third-party parser, validator, or simplifier are caught at
+each construction phase and reported as `CreateGrammarError::InternalPanic` (a
+`ValueError` in Python) instead of unwinding into the host process or through FFI.
+The fuzz corpus found two upstream defects this way: `kbnf-syntax` 0.5.3 slices
+`&input[..2]` while skipping comments and panics when a grammar starts with a
+multi-byte character, and its comment skipper loops forever on an unclosed `(*`. The
+fork converts the first into an error and refuses the second before parsing
+(`limits::find_unterminated_comment`), because no in-process limit can interrupt a
+hung parser.
 
 Failures are structured `GrammarLimitError` values in Rust and `ValueError`s with the
 same phase/resource/observed/limit message in Python. `inspect_grammar` provides the

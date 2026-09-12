@@ -979,6 +979,7 @@ impl crate::limits::GrammarComplexity {
         dict.set_item("source_bytes", self.source_bytes)?;
         dict.set_item("ast_nodes", self.ast_nodes)?;
         dict.set_item("nesting_depth", self.nesting_depth)?;
+        dict.set_item("max_alternatives", self.max_alternatives)?;
         dict.set_item("nonterminals", self.nonterminals)?;
         dict.set_item("terminals", self.terminals)?;
         dict.set_item("regexes", self.regexes)?;
