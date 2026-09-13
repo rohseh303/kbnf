@@ -33,7 +33,8 @@ The fuzz corpus found two upstream defects this way: `kbnf-syntax` 0.5.3 slices
 multi-byte character, and its comment skipper loops forever on an unclosed `(*`. The
 fork converts the first into an error and refuses the second before parsing
 (`limits::find_unterminated_comment`), because no in-process limit can interrupt a
-hung parser.
+hung parser. Both defects, with repros and one-line fixes, are written up in
+[docs/upstream-issues.md](docs/upstream-issues.md).
 
 Failures are structured `GrammarLimitError` values in Rust and `ValueError`s with the
 same phase/resource/observed/limit message in Python. `inspect_grammar` provides the
