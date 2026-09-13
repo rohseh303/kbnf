@@ -69,7 +69,9 @@ def _torch_fast_mask_logits(module:types.ModuleType):
             if num_of_disallowed>tensor.shape[-1]/2: # we have more disallowed than allowed
                 new_tensor = module.full_like(tensor,fill_value=ninf)
                 allowed = allowed.to(device=tensor.device,non_blocking=True)
-                new_tensor.put_(allowed, tensor.take(allowed))
+                # index_select/index_copy_ are implemented on every backend (CUDA, MPS, CPU);
+                # take/put_ have no MPS kernel and raised NotImplementedError on Apple Silicon.
+                new_tensor.index_copy_(0, allowed, tensor.index_select(0, allowed))
                 return new_tensor
             else: # we have more allowed than disallowed
                 tensor.index_fill_(0,disallowed.to(device=tensor.device,non_blocking=True),ninf)
