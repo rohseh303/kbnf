@@ -119,6 +119,7 @@ impl Engine {
         vocabulary: Vocabulary,
         config: Config,
     ) -> Result<Engine, CreateEngineError> {
+        let started = std::time::Instant::now();
         let tsp = config.expected_output_length;
         let regex_config = config.regex_config;
         let internal_config = config.internal_config();
@@ -178,6 +179,12 @@ impl Engine {
         } else {
             return Err(CreateEngineError::InvalidInputError);
         };
+        // Cooperative: reports (rather than prevents) an engine build that overran the
+        // compile deadline, so callers learn about vocabulary-dependent cost structurally.
+        internal_config
+            .grammar_limits
+            .check_deadline(started, crate::limits::GrammarPhase::Engine)
+            .map_err(crate::grammar::CreateGrammarError::from)?;
         Ok(Self { union: engine })
     }
 }
@@ -210,6 +217,15 @@ impl Engine {
             EngineUnion::U8U8U8U8U32(engine) => engine.earley_chart_size(),
             EngineUnion::U8U8U16U16U16(engine) => engine.earley_chart_size(),
             EngineUnion::U16U16U32U32U32(engine) => engine.earley_chart_size(),
+        }
+    }
+
+    /// Number of lazily built regex token caches currently retained.
+    pub fn regex_cache_size(&self) -> usize {
+        match &self.union {
+            EngineUnion::U8U8U8U8U32(engine) => engine.regex_cache_size(),
+            EngineUnion::U8U8U16U16U16(engine) => engine.regex_cache_size(),
+            EngineUnion::U16U16U32U32U32(engine) => engine.regex_cache_size(),
         }
     }
 

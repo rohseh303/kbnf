@@ -872,6 +872,12 @@ impl Engine {
         self.earley_chart_size()
     }
 
+    /// Number of lazily built regex token caches currently retained.
+    #[pyo3(name = "regex_cache_size")]
+    pub fn regex_cache_size_py(&self) -> usize {
+        self.regex_cache_size()
+    }
+
     /// The decode limits this engine enforces.
     #[pyo3(name = "decode_limits")]
     pub fn decode_limits_py(&self) -> crate::limits::DecodeLimits {

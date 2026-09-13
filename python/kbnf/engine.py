@@ -168,6 +168,10 @@ class Engine:
         """The ``DecodeLimits`` this engine enforces."""
         return self._internal.decode_limits()
 
+    def regex_cache_size(self)->int:
+        """Number of lazily built regex token caches currently retained."""
+        return self._internal.regex_cache_size()
+
     def reset(self)->None:
         self._internal.reset()
     

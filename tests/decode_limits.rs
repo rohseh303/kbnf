@@ -191,3 +191,54 @@ fn check_grammar_reports_simplified_metrics_without_a_vocabulary() {
         other => panic!("expected limit error, got {other:?}"),
     }
 }
+
+#[test]
+fn lazy_regex_cache_matches_eager_masks_and_is_bounded() {
+    let grammar = "start ::= #'[a-z]+' ' ' #'[0-9]+' | 'x';";
+    let tokens = ["a", "b", "ab", "1", "12", " ", "x", "!"];
+    let mut eager = Config::default();
+    eager.regex_config.min_tokens_required_for_eager_regex_cache = Some(0);
+    let mut lazy = Config::default();
+    lazy.regex_config.lazy_token_cache = true;
+    let mut capped = lazy.clone();
+    capped.decode_limits.max_regex_cache_states = Some(0);
+    let mut uncached = Config::default();
+    uncached.regex_config.min_tokens_required_for_eager_regex_cache = None;
+    let mut engines: Vec<Engine> = [eager, lazy, capped, uncached]
+        .into_iter()
+        .map(|config| Engine::with_config(grammar, vocab(&tokens), config).unwrap())
+        .collect();
+    for token in [0u32, 2, 5, 3] {
+        let masks: Vec<Vec<usize>> = engines
+            .iter_mut()
+            .map(|engine| {
+                engine.compute_allowed_token_ids();
+                engine.allowed_token_ids_from_last_computation().ones().collect()
+            })
+            .collect();
+        for (i, mask) in masks.iter().enumerate().skip(1) {
+            assert_eq!(mask, &masks[0], "engine {i} disagrees before token {token}");
+        }
+        for engine in engines.iter_mut() {
+            engine.try_accept_new_token(token).unwrap();
+        }
+    }
+    assert!(engines[1].regex_cache_size() >= 1, "lazy engine should have cached visited states");
+    assert_eq!(engines[2].regex_cache_size(), 0, "capped engine must not cache");
+    assert_eq!(engines[3].regex_cache_size(), 0);
+    assert_eq!(engines[0].regex_cache_size(), 0, "eager engine keeps caches on the grammar");
+    assert!(Config::hardened().regex_config.lazy_token_cache);
+    assert!(Config::hardened().decode_limits.max_regex_cache_states.is_some());
+}
+
+#[test]
+fn engine_build_overrun_is_reported_as_a_limit_error() {
+    let mut config = Config::hardened();
+    config.grammar_limits.max_compile_millis = Some(0);
+    match Engine::with_config("start ::= 'x';", vocab(&["x"]), config) {
+        Err(kbnf::engine::CreateEngineError::GrammarError(CreateGrammarError::ResourceLimitError(error))) => {
+            assert_eq!(error.resource, "compile_millis");
+        }
+        other => panic!("expected a compile deadline error, got {other:?}"),
+    }
+}

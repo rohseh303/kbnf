@@ -123,6 +123,12 @@ pub struct DecodeLimits {
     /// unbounded cache grows linearly with the number of distinct parser states visited.
     /// The cache is cleared when it is full; `Some(0)` disables insertion entirely.
     pub max_cache_entries: Option<usize>,
+    /// Maximum lazily built regex token caches retained per engine
+    /// (see `RegexConfig::lazy_token_cache`).
+    ///
+    /// Each entry stores two vocabulary-sized bitsets, so with a 150k-token vocabulary an
+    /// entry is about 38 KB. States beyond the cap fall back to the uncached path.
+    pub max_regex_cache_states: Option<usize>,
 }
 
 impl DecodeLimits {
@@ -132,6 +138,7 @@ impl DecodeLimits {
             max_earley_items_per_set: Some(65_536),
             max_total_earley_items: Some(1_048_576),
             max_cache_entries: Some(1_024),
+            max_regex_cache_states: Some(512),
         }
     }
 
@@ -479,6 +486,8 @@ pub enum GrammarPhase {
     Validated,
     /// After EBNF operators have been simplified.
     Simplified,
+    /// After the vocabulary-dependent engine has been built.
+    Engine,
 }
 
 impl std::fmt::Display for GrammarPhase {
@@ -491,6 +500,7 @@ impl std::fmt::Display for GrammarPhase {
                 Self::Parsed => "parsed",
                 Self::Validated => "validated",
                 Self::Simplified => "simplified",
+                Self::Engine => "engine",
             }
         )
     }

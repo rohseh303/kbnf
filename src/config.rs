@@ -82,6 +82,17 @@ pub struct RegexConfig {
     /// `None` means that the cache will be disabled.
     /// The default is `Some(1000)`.
     pub min_tokens_required_for_eager_regex_cache: Option<usize>,
+    /// Build the per-state token caches lazily, on first use while decoding, instead of
+    /// eagerly for every DFA state of every regex when the engine is constructed.
+    ///
+    /// Eager construction costs O(regex states × vocabulary) before the first token is
+    /// generated: with a 150k-token vocabulary a grammar with a thousand literal regexes
+    /// takes tens of seconds. Lazy caches keep construction independent of vocabulary size
+    /// and only pay for the states a generation actually visits; the per-engine cache is
+    /// bounded by [`DecodeLimits::max_regex_cache_states`](crate::limits::DecodeLimits).
+    /// The default is `false` for backwards compatibility; [`Config::hardened`] enables it.
+    #[serde(default)]
+    pub lazy_token_cache: bool,
 }
 
 /// The configuration of regular expressions.
@@ -101,6 +112,7 @@ impl Default for Config {
                 max_memory_usage: None,
                 fsa_type: Fsa::Dfa,
                 min_tokens_required_for_eager_regex_cache: Some(1000),
+                lazy_token_cache: false,
             },
             engine_config: EngineConfig {
                 cache_enabled: true,
@@ -122,6 +134,7 @@ impl Config {
         config.grammar_limits = GrammarLimits::hardened();
         config.decode_limits = DecodeLimits::hardened();
         config.regex_config.max_memory_usage = Some(67_108_864);
+        config.regex_config.lazy_token_cache = true;
         config
     }
 

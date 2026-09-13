@@ -218,6 +218,8 @@ where
     interned_strings: InternedStrings,
     id_to_regexes: Vec<FiniteStateAutomaton>,
     pub(crate) regex_to_token_ids: AHashMap<(RegexID<TI>, StateID, RegexType), TokensCache>,
+    /// Whether engines should build regex token caches on demand (see `RegexConfig::lazy_token_cache`).
+    pub(crate) lazy_token_cache: bool,
     id_to_regex_first_bytes: AHashMap<(TI, StateID), ByteSet>,
     id_to_regex_complement_first_bytes: AHashMap<(TI, StateID), ByteSet>,
     id_to_terminals: JaggedArray<u8, Vec<usize>, 2>,
@@ -497,9 +499,11 @@ where
         let id_to_suffix_automata_first_bytes =
             Self::construct_suffix_automata_first_bytes(&id_to_suffix_automata);
         let mut regex_to_token_ids = AHashMap::default();
-        if let Some(limit) = regex_config.min_tokens_required_for_eager_regex_cache {
-            regex_to_token_ids =
-                Self::construct_regex_to_token_ids(vocabulary, &rules, &id_to_regexes, limit);
+        if !regex_config.lazy_token_cache {
+            if let Some(limit) = regex_config.min_tokens_required_for_eager_regex_cache {
+                regex_to_token_ids =
+                    Self::construct_regex_to_token_ids(vocabulary, &rules, &id_to_regexes, limit);
+            }
         }
         Ok(Self {
             start_nonterminal_id: NonterminalID(
@@ -520,7 +524,61 @@ where
             id_to_suffix_automata,
             id_to_suffix_automata_first_bytes,
             regex_to_token_ids,
+            lazy_token_cache: regex_config.lazy_token_cache,
         })
+    }
+
+    /// Walks every vocabulary token through `regex` from `start_state` and records which
+    /// tokens stay viable and which are rejected. This is the vocabulary-dependent cost of
+    /// one regex state: O(vocabulary × token length).
+    pub(crate) fn compute_tokens_cache(
+        vocabulary: &Vocabulary,
+        regex: &FiniteStateAutomaton,
+        start_state: StateID,
+        regex_type: RegexType,
+    ) -> TokensCache {
+        let mut allowed_tokens = FixedBitSet::with_capacity(vocabulary.vocab_size());
+        let mut disallowed_tokens = FixedBitSet::with_capacity(vocabulary.vocab_size());
+        match regex {
+            FiniteStateAutomaton::Dfa(dfa) => {
+                for (token_id, token) in vocabulary.id_to_token.iter() {
+                    let mut state_id = start_state;
+                    let mut rejected = false;
+                    let mut accepted = false;
+                    for byte in token.0.iter() {
+                        if accepted && regex_type == RegexType::Early {
+                            rejected = true;
+                            break;
+                        }
+                        if accepted && regex_type == RegexType::Complement {
+                            break;
+                        }
+                        state_id = dfa.next_state(state_id, *byte);
+                        dispatch_by_dfa_state_status!(state_id,
+                            dfa,
+                            accept=>{
+                                        accepted=true;
+                            },
+                            reject=>{
+                                        rejected=true;
+                                        break;
+                                    },
+                            in_progress=>{}
+                        );
+                    }
+                    if !rejected && (!accepted || regex_type != RegexType::Complement) {
+                        allowed_tokens.insert(token_id.as_());
+                    }
+                    if rejected && !accepted || (accepted && regex_type == RegexType::Complement) {
+                        disallowed_tokens.insert(token_id.as_());
+                    }
+                }
+            }
+        }
+        TokensCache {
+            allowed_tokens,
+            disallowed_tokens,
+        }
     }
 
     fn construct_regex_to_token_ids(
@@ -555,8 +613,6 @@ where
                     match regex {
                         FiniteStateAutomaton::Dfa(dfa) => {
                             for state in dfa.states() {
-                                let mut allowed_tokens = FixedBitSet::with_capacity(vocabulary.vocab_size());
-                                let mut disallowed_tokens = FixedBitSet::with_capacity(vocabulary.vocab_size());
                                 let start_state = state.id();
                                 if regex_to_token_ids.contains_key(&(
                                     regex_id,
@@ -565,51 +621,17 @@ where
                                 )) {
                                     continue;
                                 }
-                                for (token_id, token) in vocabulary.id_to_token.iter() {
-                                    let mut state_id = start_state;
-                                    let mut rejected = false;
-                                    let mut accepted = false;
-                                    for byte in token.0.iter() {
-                                        if accepted && regex_type == RegexType::Early {
-                                            rejected = true;
-                                            break;
-                                        }
-                                        if accepted && regex_type == RegexType::Complement {
-                                            break;
-                                        }
-                                        state_id = dfa.next_state(state_id, *byte);
-                                        dispatch_by_dfa_state_status!(state_id,
-                                            dfa,
-                                            accept=>{
-                                                        accepted=true;
-                                            },
-                                            reject=>{
-                                                        rejected=true;
-                                                        break;
-                                                    },
-                                            in_progress=>{}
-                                        );
-                                    }
-                                    if !rejected
-                                        && (!accepted || regex_type != RegexType::Complement)
-                                        // if we have not been rejected, and we either has not been accepted(so in progress)
-                                        // or we are not in complement mode(while we may have been accepted, we are not rejected)
-                                    {
-                                        allowed_tokens.insert(token_id.as_());
-                                    }
-                                    if rejected&&!accepted||(accepted&&regex_type==RegexType::Complement){
-                                        // if we have been rejected, and we have never been accepted,
-                                        // or we are in complement mode and we have been accepted
-                                        disallowed_tokens.insert(token_id.as_());
-                                    }
-                                }
-                                if allowed_tokens.count_ones(..) < limit&&disallowed_tokens.count_ones(..)<limit {
+                                let cache = Self::compute_tokens_cache(
+                                    vocabulary,
+                                    regex,
+                                    start_state,
+                                    regex_type,
+                                );
+                                if cache.allowed_tokens.count_ones(..) < limit
+                                    && cache.disallowed_tokens.count_ones(..) < limit
+                                {
                                     continue;
                                 }
-                                let cache = TokensCache {
-                                    allowed_tokens,
-                                    disallowed_tokens,
-                                };
                                 regex_to_token_ids.insert((regex_id, start_state, regex_type), cache);
                             }
                         }

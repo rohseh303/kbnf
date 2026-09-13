@@ -21,12 +21,13 @@ use crate::engine::EngineConfig;
 use crate::engine_like::EngineLike;
 use crate::engine_like::WriteBufferError;
 use crate::grammar::RegexType;
+use crate::grammar::TokensCache;
 use crate::utils;
 use crate::utils::dispatch_by_dfa_state_status;
 use crate::utils::ByteSet;
 use crate::AcceptTokenResult;
 use crate::{
-    grammar::{Grammar, HIRNode, NonterminalID},
+    grammar::{Grammar, HIRNode, NonterminalID, RegexID},
     vocabulary::Vocabulary,
 };
 type EarleySets<TN, TD, TP, TSP, TS> = JaggedArray<EarleyItem<TN, TD, TP, TSP, TS>, Vec<usize>, 2>;
@@ -350,6 +351,9 @@ where
     finished: bool,
     config: EngineConfig,
     decode_limits: DecodeLimits,
+    /// Regex token caches built on demand when the grammar was constructed with
+    /// `lazy_token_cache`; boxed so entries keep a stable address while the map grows.
+    regex_token_cache: AHashMap<(RegexID<TI>, StateID, RegexType), Box<TokensCache>>,
 }
 
 impl<TI, TD, TP, TSP, TS> Debug for EngineBase<TI, TD, TP, TSP, TS>
@@ -554,6 +558,7 @@ where
             to_be_completed_items_buffer: AHashSet::default(),
             leo_items_buffer: Vec::new(),
             deduplication_buffer: AHashSet::default(),
+            regex_token_cache: AHashMap::default(),
         };
         engine.reset();
         Ok(engine)
@@ -1398,6 +1403,11 @@ where
         &self.decode_limits
     }
 
+    /// Number of lazily built regex token caches currently retained.
+    pub fn regex_cache_size(&self) -> usize {
+        self.regex_token_cache.len()
+    }
+
     fn accept_byte(
         grammar: &Grammar<TI>,
         earley_sets: &mut EarleySets<TI, TD, TP, TSP, TS>,
@@ -1524,7 +1534,25 @@ where
                 FiniteStateAutomaton::Dfa(dfa) => dfa.stride2(),
             };
             let state_id = Self::from_state_id_to_dfa_state_id(item.state_id, stride2);
-            if let Some(token_ids) = cache.get(&(regex_id, state_id, regex_type)) {
+            let key = (regex_id, state_id, regex_type);
+            let token_ids: Option<&TokensCache> = if let Some(token_ids) = cache.get(&key) {
+                Some(token_ids)
+            } else if self.grammar.lazy_token_cache {
+                if !self.regex_token_cache.contains_key(&key)
+                    && self
+                        .decode_limits
+                        .max_regex_cache_states
+                        .is_none_or(|cap| self.regex_token_cache.len() < cap)
+                {
+                    let computed =
+                        Grammar::<TI>::compute_tokens_cache(&self.vocabulary, dfa, state_id, regex_type);
+                    self.regex_token_cache.insert(key, Box::new(computed));
+                }
+                self.regex_token_cache.get(&key).map(|boxed| &**boxed)
+            } else {
+                None
+            };
+            if let Some(token_ids) = token_ids {
                 self.allowed_token_ids.union_with(&token_ids.allowed_tokens);
                 self.disallowed_token_ids
                     .intersect_with(&token_ids.disallowed_tokens);
@@ -1736,7 +1764,7 @@ where
         let mut rejected_prefixes = AHashSet::new();
         let mut skipped_items_indices = Vec::new();
         let mut current_skipped_items_indices = None;
-        if !self.grammar.regex_to_token_ids.is_empty() {
+        if !self.grammar.regex_to_token_ids.is_empty() || self.grammar.lazy_token_cache {
             self.disallowed_token_ids.insert_range(..);
             current_skipped_items_indices = Some(FixedBitSet::with_capacity(
                 self.earley_sets
