@@ -42,8 +42,10 @@ The profile bounds two phases:
   runs), DFA memory, estimated EBNF expansion, simplified productions/symbols, and a
   cooperative compile deadline.
 - **Decoding** (`Config::decode_limits`, a `DecodeLimits`): the number of Earley items in
-  the newest set and across the whole chart after every accepted byte, and the number of
-  entries retained in the allowed-token cache. A token that would exceed a chart budget is
+  the newest set and across the whole chart after every accepted byte, the number of
+  entries retained in the allowed-token cache, and the number of lazily built regex token
+  caches (`RegexConfig::lazy_token_cache` keeps engine construction independent of
+  vocabulary size). A token that would exceed a chart budget is
   masked out during `compute_allowed_token_ids` and rejected with
   `AcceptTokenError::ResourceLimitExceeded` if forced, leaving the engine state untouched.
 

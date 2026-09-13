@@ -54,6 +54,15 @@ parser state it sees. `Config::decode_limits` (`DecodeLimits`, enabled by
 - Earley items across the whole chart; and
 - retained allowed-token cache entries (the cache is cleared when full).
 
+Engine construction itself used to scale with the vocabulary: the eager regex token
+cache walked every vocabulary token for every DFA state of every regex, so a grammar
+with a thousand literal regexes took tens of seconds against a 150k-token vocabulary
+even though the vocabulary-free admission check passed in milliseconds.
+`RegexConfig::lazy_token_cache` (on in `Config::hardened()`) builds those caches on
+first use during decoding instead, bounded per engine by
+`DecodeLimits::max_regex_cache_states`, and `Engine::with_config` reports a build that
+overran `max_compile_millis` as a structured error.
+
 A token whose acceptance would exceed a chart budget is excluded from the allowed set
 during `compute_allowed_token_ids`; forcing it through `try_accept_new_token` or
 `update_logits` returns `ResourceLimitExceeded` and leaves the engine state unchanged.
